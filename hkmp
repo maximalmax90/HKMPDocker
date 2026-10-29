@@ -1,51 +1,247 @@
-#!/bin/bash
-SESSION="server"
-LOG="logs/server.log"
-EXE="HKMPServer.exe"
-PDB="HKMPServer.pdb"
-DIR="/HKMP"
-TMPDIR="/FILES"
+#!/usr/bin/env bash
+#
+# Console client for the HKMP server running in this container.
+#
+# Anything that is not one of the wrapper's own subcommands is typed straight
+# into the server console, so the upstream command set stays available without
+# this script having to know about it.
 
-execute() {
-        STR="${@}"^M
-        screen -S server -X stuff "$STR"
-        sleep 1;
-        tail -n1 ${LOG}
+set -euo pipefail
+
+readonly PAYLOAD_DIR="${HKMP_HOME:-/opt/hkmp}"
+readonly DATA_DIR="${HKMP_DATA:-/data}"
+readonly OWNER_FILE=/run/hkmp/owner
+readonly SESSION=hkmp
+readonly TUI=/usr/local/lib/hkmp/tui.py
+readonly LOG_FILE="${DATA_DIR}/logs/server.log"
+readonly RELEASE_URL=https://api.github.com/repos/Extremelyd1/HKMP/releases/latest
+
+die() { printf 'hkmp: %s\n' "$*" >&2; exit 1; }
+
+# `docker exec` lands here as root, but the screen session belongs to the
+# server's user and its socket directory is private to them.
+reexec_as_owner() {
+    (( EUID == 0 )) || return 0
+    [[ -r "$OWNER_FILE" ]] || return 0
+
+    local owner
+    owner="$(cat "$OWNER_FILE")"
+    [[ "$owner" == 0:* ]] && return 0
+
+    exec su-exec "$owner" "$0" "$@"
 }
 
-help() {
-        echo "Usage:"
-        echo "All commands sends to server by default. Check the official wiki for a complete list of commands."
-        echo "Additional commands:"
-        echo "exit - stop a server"
-        echo "check - check for update"
-        echo "update - update a server. Attention, the container must have a restart policy of \"always\", otherwise you will need to start the container manually!"
+session_exists() {
+    screen -S "$SESSION" -Q select . >/dev/null 2>&1
+}
+
+require_session() {
+    session_exists || die "the server console is not running"
+}
+
+# Reads back whatever the server appended to its log in response. The server
+# echoes the command it received, so the echo shows up first and doubles as
+# confirmation that the input arrived.
+send() {
+    local cmd="$*"
+    [[ -n "${cmd// }" ]] || die "no command given, try 'hkmp help'"
+    require_session
+
+    local before=0
+    [[ -f "$LOG_FILE" ]] && before="$(stat -c %s "$LOG_FILE")"
+
+    screen -S "$SESSION" -p 0 -X stuff "${cmd}"$'\r'
+
+    local waited=0 size
+    while (( waited < 30 )); do
+        sleep 0.1
+        waited=$(( waited + 1 ))
+        [[ -f "$LOG_FILE" ]] || continue
+        size="$(stat -c %s "$LOG_FILE")"
+        if (( size > before )); then
+            # Give a multi-line answer a moment to finish landing.
+            sleep 0.2
+            tail -c "+$(( before + 1 ))" "$LOG_FILE"
+            return 0
+        fi
+    done
+
+    die "no response from the server within 3s"
+}
+
+installed_version() {
+    cat "${PAYLOAD_DIR}/version" 2>/dev/null || echo unknown
 }
 
 check() {
-        REMOTE=$(curl -s https://api.github.com/repos/Extremelyd1/HKMP/releases | egrep 'html_url.*tag' | awk -F\" '{print $4}' | cut -d\/ -f8 | head -n1);
-        if [ -f ${DIR}/version ]; then
-                LOCAL=$(cat ${DIR}/version);
-                [ "$LOCAL" == "$REMOTE" ] && echo "No update required" || echo -e "Local build: $LOCAL\nRemote build: $REMOTE\nUpdate available.";
-        else
-                echo "Local version file not found, try checking checksums...";
-                curl -o ${TMPDIR}/HKMPServer.zip -sOL https://github.com/Extremelyd1/HKMP/releases/download/$REMOTE/HKMPServer.zip;
-                unzip -o ${TMPDIR}/HKMPServer.zip -d ${TMPDIR} && rm ${TMPDIR}/HKMPServer.zip;
-                EXE_LOCAL=$(md5sum ${DIR}/${EXE} | cut -d" " -f1);
-                EXE_REMOTE=$(md5sum ${TMPDIR}/${EXE} | cut -d" " -f1);
-                PDB_LOCAL=$(md5sum ${DIR}/${PDB} | cut -d" " -f1);
-                PDB_REMOTE=$(md5sum ${TMPDIR}/${PDB} | cut -d" " -f1);
-                [[ "$EXE_REMOTE" == "$EXE_LOCAL" && "$PDB_REMOTE" == "$PDB_LOCAL" ]] && echo "File checksums match. You have version: $REMOTE" && echo $REMOTE > ${DIR}/version || echo "Checksum of files mismatch. You have an outdated version. Update available.";
-        fi
-}
-update() {
-        touch ${DIR}/update;
-        execute "exit";
+    local local_version remote
+    local_version="$(installed_version)"
+
+    remote="$(curl -fsSL "$RELEASE_URL" 2>/dev/null | jq -r '.tag_name // empty')" \
+        || die "could not reach the GitHub release API"
+    [[ -n "$remote" ]] || die "could not read the latest release tag"
+
+    printf 'installed: %s\nlatest:    %s\n' "$local_version" "$remote"
+
+    if [[ "$local_version" == "$remote" ]]; then
+        echo 'up to date'
+        return 0
+    fi
+
+    cat <<EOF
+
+A newer release is available. This image is immutable, so update it by
+pulling a new image rather than from inside the container:
+
+    docker compose pull && docker compose up -d
+    # or: docker pull maximalmax90/hkmpserver:${remote}
+
+Your data in ${DATA_DIR} is kept.
+EOF
 }
 
-case "$1" in
-        "check"  ) check;;
-        "update" ) update;;
-        "help"   ) help;;
-        *        ) execute ${@};;
-esac
+status() {
+    printf 'version: %s\n' "$(installed_version)"
+    # Two images can hold the same server: v2.4.3 and v2.4.3-2 differ only in
+    # the wrapper, so support questions need the tag as well.
+    [[ -n "${HKMP_IMAGE_TAG:-}" && "$HKMP_IMAGE_TAG" != "$(installed_version)" ]] \
+        && printf 'image:   %s\n' "$HKMP_IMAGE_TAG"
+    printf 'port:    %s/udp\n' "${PORT:-2222}"
+    if session_exists; then
+        echo 'console: running'
+    else
+        echo 'console: not running'
+    fi
+    if port_bound "${PORT:-2222}"; then
+        echo 'socket:  bound'
+    else
+        echo 'socket:  not bound'
+    fi
+}
+
+# Checks the UDP socket straight out of /proc, which avoids pulling iproute2
+# into the image just for the health check.
+port_bound() {
+    local hex
+    printf -v hex '%04X' "$1"
+
+    local f
+    for f in /proc/net/udp /proc/net/udp6; do
+        [[ -r "$f" ]] || continue
+        if awk -v want="$hex" 'NR > 1 {
+                split($2, a, ":")
+                if (a[2] == want) { found = 1; exit }
+            }
+            END { exit !found }' "$f"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+healthcheck() {
+    session_exists || die "console session is gone"
+    pgrep -f 'HKMPServer\.exe' >/dev/null 2>&1 || die "server process is not running"
+    port_bound "${PORT:-2222}" || die "UDP port ${PORT:-2222} is not bound"
+    # A server that cannot write its log is up but mute: no `docker logs`
+    # output and no answers to any command sent through this script.
+    [[ -f "$LOG_FILE" ]] || die "server is running but has not written ${LOG_FILE}"
+    echo ok
+}
+
+logs() {
+    local lines="${1:-50}"
+    [[ "$lines" =~ ^[0-9]+$ ]] || die "logs takes a line count, got '${lines}'"
+    [[ -f "$LOG_FILE" ]] || die "no log file at ${LOG_FILE} yet"
+    tail -n "$lines" "$LOG_FILE"
+}
+
+# The console is the thing people leave open, so a stray Ctrl-C or a crash
+# should put it back rather than drop them at a bare shell. Only a clean quit
+# (F10) returns success and ends the loop.
+tui() {
+    require_session
+    [[ -t 0 && -t 1 ]] \
+        || die "the console needs a terminal, run: docker exec -it <container> hkmp"
+    [[ -r "$TUI" ]] || die "console not installed at ${TUI}"
+
+    local failures=0 started
+    while :; do
+        started=$SECONDS
+        if python3 "$TUI"; then
+            return 0
+        fi
+        # Dying immediately means it cannot start at all; restarting then would
+        # just spin and bury the error that explains why.
+        if (( SECONDS - started < 5 )); then
+            failures=$(( failures + 1 ))
+            (( failures < 3 )) || die "the console keeps failing to start, see above"
+        else
+            failures=0
+        fi
+        printf 'hkmp: console stopped unexpectedly, restarting...\n' >&2
+        sleep 1
+    done
+}
+
+# The raw screen session, for when the server's own prompt is wanted.
+attach() {
+    require_session
+    [[ -t 0 ]] || die "attaching needs a terminal, run: docker exec -it <container> hkmp attach"
+    echo 'Attaching to the raw server console. Detach with Ctrl-A then D.' >&2
+    echo 'Careful: Ctrl-C here goes to the server.' >&2
+    exec screen -r "$SESSION"
+}
+
+usage() {
+    cat <<EOF
+Usage: hkmp [command] [arguments]
+
+With no arguments on a terminal this opens the full-screen console:
+
+    docker exec -it <container> hkmp
+
+Any command that is not listed below is sent to the server console as typed,
+so the full upstream command set works: list, set, announce, kick, ban,
+unban, banip, unbanip, whitelist, auth, deauth, team, skin, copysave, log.
+See https://github.com/Extremelyd1/HKMP for what each of them does.
+
+Wrapper commands:
+  console           The full-screen console, same as no arguments
+  attach            The raw server prompt in screen, detach with Ctrl-A D
+  status            Show version, port and whether the server is up
+  check             Compare the built-in version against the latest release
+  logs [lines]      Print the tail of the server log (default 50 lines)
+  healthcheck       Probe used by the container HEALTHCHECK
+  help              This text
+
+Stopping the server:
+  Use 'docker stop' — the container asks the server to exit cleanly and waits
+  up to STOP_TIMEOUT seconds. Typing 'hkmp exit' also works and stops the
+  container, which a restart policy will then act on.
+EOF
+}
+
+main() {
+    # Bare `hkmp` is a person at a terminal wanting the console; in a script
+    # it is a mistake, so that gets the usage text instead.
+    if (( $# == 0 )); then
+        if [[ -t 0 && -t 1 ]]; then tui; else usage; fi
+        return
+    fi
+
+    case "$1" in
+        console|tui)  tui ;;
+        attach)       attach ;;
+        status)       status ;;
+        check)        check ;;
+        logs)         shift; logs "$@" ;;
+        healthcheck)  healthcheck ;;
+        help|-h|--help) usage ;;
+        version|--version) installed_version ;;
+        *)            send "$@" ;;
+    esac
+}
+
+reexec_as_owner "$@"
+main "$@"

@@ -1,0 +1,23 @@
+services:
+  hkmp:
+    image: maximalmax90/hkmpserver:latest
+    container_name: hkmp
+    restart: unless-stopped
+    environment:
+      # UDP port the server listens on; keep it in sync with the mapping below.
+      PORT: 2222
+      # Synchronise bosses, enemies, world state and saves (HKMP 2.4.3+).
+      FULL_SYNC: "false"
+      # Ownership of the data volume.
+      PUID: 1000
+      PGID: 1000
+      TZ: Europe/Moscow
+    ports:
+      - "2222:2222/udp"
+    volumes:
+      - hkmp-data:/data
+    # Long enough for the server to disconnect players and flush its state.
+    stop_grace_period: 40s
+
+volumes:
+  hkmp-data:
