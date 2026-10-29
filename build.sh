@@ -126,9 +126,15 @@ info "image:     ${IMAGE}:${version}$($tag_latest && echo " (+ :latest)")"
 if $push; then
     info "platforms: ${PLATFORMS}"
 
+    # buildx carries its own emulation, so a foreign-architecture build works
+    # even where the host cannot register binfmt handlers. Offering them is
+    # still worth it on hosts that can, hence the attempt and the shrug.
     if [[ "$PLATFORMS" == *,* ]] && [[ ! -e /proc/sys/fs/binfmt_misc/qemu-aarch64 ]]; then
-        info "installing qemu binfmt handlers"
-        docker run --privileged --rm tonistiigi/binfmt --install arm64 >/dev/null
+        if docker run --privileged --rm tonistiigi/binfmt --install arm64 >/dev/null 2>&1; then
+            info "registered qemu binfmt handlers on the host"
+        else
+            info "host binfmt handlers unavailable, relying on buildx emulation"
+        fi
     fi
 
     if ! docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
